@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"sync/atomic"
+	"time"
 )
 
 var enableDebugLogs uint32
@@ -162,6 +163,10 @@ func (c *UDPConn) Close() error {
 	}
 	mapMutex.Unlock()
 	return c.nconn.Close()
+}
+
+func (c *UDPConn) SetDeadline(t time.Time) error {
+	return c.nconn.SetDeadline(t)
 }
 
 func sometimes(percentage int) bool {
