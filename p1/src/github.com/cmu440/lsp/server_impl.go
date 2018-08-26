@@ -24,7 +24,7 @@ const (
 	defaultReceiveCapacity = 1024
 	defaultSendCapacity    = 1024
 
-	msgClose MsgType = MsgType(0xff)
+	msgClose = MsgType(0xff)
 )
 
 type receiveMsg struct {
@@ -123,7 +123,6 @@ func NewServer(port int, params *Params) (Server, error) {
 
 	server.cond = sync.NewCond(server.mu)
 
-	debug("server start...\n")
 	go server.start()
 
 	return &server, nil
@@ -182,7 +181,7 @@ func (s *server) handleConnect(addr *lspnet.UDPAddr) {
 	id, ok := s.addr2id[addr.String()]
 	if !ok {
 		id = s.nextConnID()
-		debug("server new client connection [%d]\n", id)
+		debug("[server %d] new client connection\n", id)
 		address := addr.String()
 		s.addr2id[address] = id
 		client := &clientConn{
@@ -307,7 +306,7 @@ func (s *server) Close() error {
 }
 
 func (s *server) removeClient(address string, connId int) {
-	debug("server remove client [%d]\n", connId)
+	debug("[server %d] removed\n", connId)
 	s.mu.Lock()
 	delete(s.connections, connId)
 	delete(s.addr2id, address)
@@ -346,11 +345,12 @@ type clientConn struct {
 }
 
 func (c *clientConn) close() {
-	debug("server close connection between client %d...\n", c.id)
+	debug("[server %d] closing connection between client ...\n", c.id)
 	c.closeC <- struct{}{}
 }
 
 func (c *clientConn) send(msg *Message) {
+	debug("[server %d] send message: %s\n", c.id, msg.String())
 	c.s.send(msg, c.addr)
 }
 
@@ -381,6 +381,7 @@ func (c *clientConn) write(payload []byte, close bool) {
 	default:
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		debug("[server %d] pending message: %s\n", c.id, msg.String())
 		c.pendingBuf.PushBack(msg)
 	}
 }
@@ -392,7 +393,7 @@ func (c *clientConn) onSendData(msg *Message) {
 		c.sendData(msg, 0)
 		c.windowSize--
 	} else {
-		debug("server client [%d] pending message: %s\n", c.id, msg.String())
+		debug("[server %d] pending message: %s\n", c.id, msg.String())
 		c.pendingBuf.PushBack(msg)
 		c.mu.Unlock()
 	}
@@ -400,9 +401,19 @@ func (c *clientConn) onSendData(msg *Message) {
 
 func (c *clientConn) onReceiveData(msg *Message) {
 
+	debug("[server %d] receive data: %s\n", c.id, msg.String())
+
 	if msg.SeqNum == c.receivedDataSeq+1 {
 		c.receivedDataSeq++
 		c.send(NewAck(c.id, msg.SeqNum))
+
+		if msg.Type == msgClose {
+			c.isClosed = true
+			debug("[server %d] delivery message: ClientClosed\n", c.id)
+			c.receivedMsgC <- newDeliveryMsg(msgClientClosed, c.id, nil)
+			return
+		}
+		debug("[server %d] delivery message %d\n", c.id, msg.SeqNum)
 		c.receivedMsgC <- newDeliveryMsg(msgDataReceived, c.id, msg.Payload)
 
 		if c.receiveBuf.Len() != 0 {
@@ -416,6 +427,14 @@ func (c *clientConn) onReceiveData(msg *Message) {
 					toRemove = append(toRemove, elem)
 					c.receivedDataSeq++
 					c.send(NewAck(c.id, m.SeqNum))
+
+					if msg.Type == msgClose {
+						c.isClosed = true
+						debug("[server %d] delivery message: ClientClosed\n", c.id)
+						c.receivedMsgC <- newDeliveryMsg(msgClientClosed, c.id, nil)
+						return
+					}
+					debug("[server %d] delivery message: %d\n", c.id, m.SeqNum)
 					c.receivedMsgC <- newDeliveryMsg(msgDataReceived, c.id, m.Payload)
 				} else {
 					break
@@ -443,7 +462,7 @@ func (c *clientConn) onReceiveData(msg *Message) {
 
 func (c *clientConn) onReceiveAck(msg *Message) {
 
-	debug("server client [%d] receive ack: %s\n", c.id, msg.String())
+	debug("[server %d] receive ack: %s\n", c.id, msg.String())
 
 	seq := msg.SeqNum
 
@@ -475,10 +494,10 @@ func (c *clientConn) onReceiveAck(msg *Message) {
 
 	if c.inClose {
 		if len(c.sendBuf) == 0 && c.pendingBuf.Len() == 0 {
-			debug("server connection between client [%d] has closed\n", c.id)
+			debug("[server %d] connection closed\n", c.id)
 			c.isClosed = true
 		} else {
-			debug("sendBuf: %d, pendingBuf: %d\n", len(c.sendBuf), c.pendingBuf.Len())
+			debug("[server %d] sendBuf: %d, pendingBuf: %d\n", c.id, len(c.sendBuf), c.pendingBuf.Len())
 		}
 	}
 }
@@ -490,12 +509,13 @@ func (c *clientConn) onTimeout() {
 	for _, t := range c.sendBuf {
 		if t.expireTime.Before(now) {
 			if t.epochCount > c.params.EpochLimit {
-				debug("server client [%d] connection is lost", c.id)
+				debug("[server %d] connection is lost", c.id)
+				debug("[server %d] delivery message: ClientClosed\n", c.id)
 				c.receivedMsgC <- newDeliveryMsg(msgClientClosed, c.id, nil)
 				c.isClosed = true
 				return
 			} else {
-				debug("server client [%d] %d-th resend message: %s\n", c.id, t.epochCount+1, t.msg.String())
+				debug("[server %d] %d-th resend message: %s\n", c.id, t.epochCount+1, t.msg.String())
 				c.sendData(t.msg, t.epochCount+1)
 			}
 		} else {
@@ -542,7 +562,7 @@ func (c *clientConn) start() {
 		}
 		select {
 		case <-c.closeC:
-			debug("server client [%d] in closing...\n", c.id)
+			debug("[server %d] is closing...\n", c.id)
 			c.inClose = true
 			c.write(nil, true) // notify peer to close connection
 		case <-c.timer.C:
@@ -551,22 +571,26 @@ func (c *clientConn) start() {
 				return
 			}
 		case msg := <-c.outboundC:
-			if (c.inClose || c.isClosed) && msg.Type != msgClose {
+			if c.isClosed {
 				// stop send new data if current connection is decided to close
+				debug("[server %d] skip message: %s\n", c.id, msg.String())
 				continue
 			}
 			c.onSendData(msg)
 		case msg := <-c.inboundC:
-			debug("server [%d] receive message: %s\n", c.id, msg.String())
+
 			switch msg.Type {
 			case MsgConnect:
-				debug("server [%d] receive connect after connection has established, ignore message", c.id)
+				debug("[server %d] receive connect after connection has established, ignore message", c.id)
 			case MsgData:
 				c.onReceiveData(msg)
 			case MsgAck:
 				c.onReceiveAck(msg)
 			case msgClose:
 				// connection closed by peer
+				debug("[server %d] closed by peer", c.id)
+				c.inClose = true
+				c.onReceiveData(msg)
 			}
 		}
 	}

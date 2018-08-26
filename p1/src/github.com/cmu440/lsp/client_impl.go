@@ -13,7 +13,7 @@ import (
 	"github.com/cmu440/lspnet"
 )
 
-const debugOn = false
+const debugOn = true
 
 func debug(format string, v ...interface{}) {
 	if debugOn {
@@ -21,11 +21,17 @@ func debug(format string, v ...interface{}) {
 	}
 }
 
+func init() {
+	lspnet.EnableDebugLogs(true)
+}
+
 const (
 	stateConnecting int32 = iota
 	stateConnected
-	stateClosing
-	stateClosed
+	stateActiveClosing
+	statePassiveClosing
+	stateActiveClosed
+	statePassiveClosed
 )
 
 const (
@@ -152,17 +158,17 @@ func (c *client) connect(addr *lspnet.UDPAddr) (int, error) {
 
 	for i := 0; i < c.params.EpochLimit; i++ {
 
-		debug("client connect try [%d]...", i+1)
+		debug("[client %d] connect try %d...", c.connID, i+1)
 
 		timeout := time.Now().Add(time.Millisecond * time.Duration(c.params.EpochMillis))
 		c.conn.SetDeadline(timeout)
 
 		if _, err = c.conn.Write(reqBytes); err != nil {
 			if err, ok := err.(net.Error); ok && err.Timeout() {
-				debug("client write timeout")
+				debug("[client %d] write timeout", c.connID)
 				continue
 			} else {
-				debug("write udp error: %s\n", err.Error())
+				debug("[client %d] write udp error: %s\n", c.connID, err.Error())
 				now := time.Now()
 				if now.Before(timeout) {
 					time.Sleep(timeout.Sub(now))
@@ -176,10 +182,10 @@ func (c *client) connect(addr *lspnet.UDPAddr) (int, error) {
 
 		if err := decoder.Decode(&response); err != nil {
 			if err, ok := err.(net.Error); ok && err.Timeout() {
-				debug("client read timeout")
+				debug("[client %d] read timeout", c.connID)
 				continue
 			} else {
-				debug("read udp error: %s\n", err.Error())
+				debug("[client %d] read udp error: %s\n", c.connID, err.Error())
 				now := time.Now()
 				if now.Before(timeout) {
 					time.Sleep(timeout.Sub(now))
@@ -191,11 +197,9 @@ func (c *client) connect(addr *lspnet.UDPAddr) (int, error) {
 
 		}
 
-		debug("client receive: %s\n", response.String())
-
 		if response.Type == MsgAck {
 			c.conn.SetDeadline(time.Time{})
-			debug("client connect succeeded\n")
+			debug("[client %d] connect succeeded\n", response.ConnID)
 			return response.ConnID, nil
 		}
 	}
@@ -204,7 +208,7 @@ func (c *client) connect(addr *lspnet.UDPAddr) (int, error) {
 }
 
 func (c *client) send(msg *Message) {
-	debug("client [%d] send message: %s\n", c.connID, msg.String())
+	debug("[client %d] send message: %s\n", c.connID, msg.String())
 	data, _ := json.Marshal(msg)
 	c.conn.Write(data)
 }
@@ -236,7 +240,7 @@ func (c *client) start() {
 
 	readFunc := func() {
 		defer func() {
-			debug("client read goroutine exit")
+			debug("[client %d] read goroutine exit\n", c.connID)
 			c.notifyC <- struct{}{}
 		}()
 
@@ -246,9 +250,16 @@ func (c *client) start() {
 			msg := new(Message)
 
 			if err := decoder.Decode(msg); err != nil {
-				debug("client [%d] decode message error: %s\n", c.connID, err.Error())
-				atomic.StoreInt32(&c.connState, stateClosed)
-				close(c.receivedMsgC)
+				debug("[client %d] decode message error: %s\n", c.connID, err.Error())
+				for state := atomic.LoadInt32(&c.connState); state < stateActiveClosed; {
+					if state == stateActiveClosing &&
+						atomic.CompareAndSwapInt32(&c.connState, state, stateActiveClosed) {
+						break
+					} else if state == statePassiveClosing &&
+						atomic.CompareAndSwapInt32(&c.connState, state, statePassiveClosed) {
+						break
+					}
+				}
 				return
 			} else {
 				c.receiveMsgC <- msg
@@ -259,17 +270,17 @@ func (c *client) start() {
 	go readFunc()
 
 	defer func() {
-		debug("client message processing goroutine exit")
+		debug("[client %d] message processing goroutine exit\n", c.connID)
 		c.conn.Close()
 		c.notifyC <- struct{}{}
 	}()
 
 	onReceiveData := func(msg *Message) {
 
-		debug("client [%d] receive data: %s\n", c.connID, msg.String())
+		debug("[client %d] receive data: %s\n", c.connID, msg.String())
 
-		if atomic.LoadInt32(&c.connState) == stateClosed {
-			debug("client [%d] receive data after closed\n", c.connID)
+		if atomic.LoadInt32(&c.connState) >= stateActiveClosed {
+			debug("[client %d] receive data after closed\n", c.connID)
 			return
 		}
 
@@ -281,10 +292,15 @@ func (c *client) start() {
 
 			if msg.Type == msgClose {
 				// current connection has closed my peer
-				atomic.StoreInt32(&c.connState, stateClosed)
+				for state := atomic.LoadInt32(&c.connState); state < stateActiveClosed; {
+					if atomic.CompareAndSwapInt32(&c.connState, state, statePassiveClosed) {
+						close(c.closeC)
+						break
+					}
+				}
 				return
 			}
-			debug("client delivery message: %s\n", msg.String())
+			debug("[client %d] delivery message: %s\n", c.connID, msg.String())
 			c.receivedMsgC <- msg
 
 			if c.receiveBuf.Len() != 0 {
@@ -302,10 +318,15 @@ func (c *client) start() {
 
 						if m.Type == msgClose {
 							// current connection has closed my peer
-							atomic.StoreInt32(&c.connState, stateClosed)
+							for state := atomic.LoadInt32(&c.connState); state < stateActiveClosed; {
+								if atomic.CompareAndSwapInt32(&c.connState, state, statePassiveClosed) {
+									close(c.closeC)
+									break
+								}
+							}
 							return
 						}
-						debug("client delivery message: %s\n", m.String())
+						debug("[client %d] delivery message: %s\n", c.connID, m.String())
 						c.receivedMsgC <- m
 					} else {
 						break
@@ -338,7 +359,7 @@ func (c *client) start() {
 
 	onReceiveAck := func(msg *Message) {
 
-		debug("client receive ack: %s\n", msg.String())
+		debug("[client %d] receive ack: %s\n", c.connID, msg.String())
 		seq := msg.SeqNum
 
 		if seq >= c.lastAckSeq+1 {
@@ -364,7 +385,7 @@ func (c *client) start() {
 
 			for c.windowSize > 0 && c.pendingBuf.Len() > 0 {
 				front := c.pendingBuf.Front()
-				debug("client [%d] send message: %s\n", c.connID, front.Value.(*Message).String())
+				debug("[client %d] send message: %s\n", c.connID, front.Value.(*Message).String())
 				c.sendData(front.Value.(*Message), 0)
 				c.pendingBuf.Remove(front)
 				c.windowSize--
@@ -372,21 +393,25 @@ func (c *client) start() {
 		}
 
 		state := atomic.LoadInt32(&c.connState)
-		if state == stateClosing && c.pendingBuf.Len() == 0 && len(c.sendBuf) == 0 {
-			debug("client closing, all pending messages have sent out\n")
-			atomic.StoreInt32(&c.connState, stateClosed)
-			c.conn.Close()
+		if state >= stateActiveClosing && c.pendingBuf.Len() == 0 && len(c.sendBuf) == 0 {
+			debug("[client %d] closing, all pending messages have sent out\n", c.connID)
+
+			for state := atomic.LoadInt32(&c.connState); state < stateActiveClosed; {
+				if atomic.CompareAndSwapInt32(&c.connState, stateActiveClosing, stateActiveClosed) {
+					break
+				}
+			}
 		}
 	}
 
 	onSendData := func(msg *Message) {
 
 		if c.windowSize > 0 && c.pendingBuf.Len() == 0 {
-			debug("client [%d] send message: %s\n", c.connID, msg.String())
+			debug("[client %d] send message: %s\n", c.connID, msg.String())
 			c.sendData(msg, 0)
 			c.windowSize--
 		} else {
-			debug("client pending message: %s\n", msg.String())
+			debug("[client %d] pending message: %s\n", c.connID, msg.String())
 			c.pendingBuf.PushBack(msg)
 		}
 	}
@@ -400,11 +425,15 @@ func (c *client) start() {
 			if t.expireTime.Before(now) {
 				if t.epochCount > c.params.EpochLimit {
 					// connection is assumed to be lost
-					debug("client [%d] connection is lost\n", c.connID)
-					c.connState = stateClosed
+					debug("[client %d] connection is lost\n", c.connID)
+					for state := atomic.LoadInt32(&c.connState); state < stateActiveClosed; {
+						if atomic.CompareAndSwapInt32(&c.connState, state, stateActiveClosed) {
+							break
+						}
+					}
 					return
 				} else {
-					debug("client [%d] %d-th resend message: %s\n", c.connID, t.epochCount+1, t.msg.String())
+					debug("[client %d] %d-th resend message: %s\n", c.connID, t.epochCount+1, t.msg.String())
 					c.sendData(t.msg, t.epochCount+1)
 				}
 			} else {
@@ -423,20 +452,19 @@ func (c *client) start() {
 	c.resetTimer(time.Millisecond * time.Duration(c.params.EpochMillis))
 
 	for {
-		if atomic.LoadInt32(&c.connState) == stateClosed {
+		if atomic.LoadInt32(&c.connState) >= stateActiveClosed {
 			break
 		}
 
 		select {
 		case <-c.closeC:
-			atomic.StoreInt32(&c.connState, stateClosing)
+			atomic.StoreInt32(&c.connState, stateActiveClosing)
 
-			if len(c.sendBuf) == 0 && c.pendingBuf.Len() == 0 {
-				return
-			}
+			// send close message to peer
+			c.write(nil, true)
 		case <-c.timer.C:
 			onTimeout()
-			if c.connState == stateClosed {
+			if atomic.LoadInt32(&c.connState) >= stateActiveClosed {
 				return
 			}
 		case msg := <-c.receiveMsgC:
@@ -444,19 +472,23 @@ func (c *client) start() {
 			case MsgAck:
 				onReceiveAck(msg)
 			case MsgConnect:
-				debug("receive connect after connection has established, ignore message")
+				debug("[client %d] receive connect after connection has established, ignore message\n", c.connID)
 			case MsgData:
 				onReceiveData(msg)
 			case msgClose:
-				// connection is closed by peer
-				atomic.StoreInt32(&c.connState, stateClosing)
+				// connection is closed by peer,
+				debug("[client %d] connection is closed by peer\n", c.connID)
+				for state := atomic.LoadInt32(&c.connState); state < stateActiveClosing; {
+					if atomic.CompareAndSwapInt32(&c.connState, state, statePassiveClosing) {
+						break
+					}
+				}
 				onReceiveData(msg)
-				debug("connection [%d] is closed by peer", c.connID)
 			}
 		case msg := <-c.sendMsgC:
-			if c.connState == stateClosing {
-				continue
-			}
+			//if atomic.LoadInt32(&c.connState) >= stateActiveClosing {
+			//	continue
+			//}
 			onSendData(msg)
 		}
 	}
@@ -468,58 +500,72 @@ func (c *client) ConnID() int {
 
 func (c *client) Read() ([]byte, error) {
 
-	state := atomic.LoadInt32(&c.connState)
-	if state == stateClosing || state == stateClosed {
-		return nil, ErrClosed
+	select {
+	case msg := <-c.receivedMsgC:
+		debug("[client %d] Read() return message: %s\n", c.connID, msg.String())
+		return msg.Payload, nil
+	default:
+		if state := atomic.LoadInt32(&c.connState); state >= stateActiveClosed {
+			debug("[client %d] Read() return ErrClosed")
+			return nil, ErrClosed
+		}
 	}
 
 	select {
-	case msg, ok := <-c.receivedMsgC:
-		if ok {
-			debug("client Read() return message: %s\n", msg.String())
-			return msg.Payload, nil
-		} else {
-			return nil, ErrClosed
-		}
+	case msg := <-c.receivedMsgC:
+		debug("[client %d] Read() return message: %s\n", c.connID, msg.String())
+		return msg.Payload, nil
 	case <-c.closeC:
+		debug("[client %d] Read() return ErrClosed")
 		return nil, ErrClosed
 	}
 }
 
-func (c *client) Write(payload []byte) error {
-	state := atomic.LoadInt32(&c.connState)
-	if state == stateClosing || state == stateClosed {
-		return ErrClosed
+func (c *client) write(payload []byte, close bool) error {
+
+	var msg *Message
+
+	if close {
+		c.seqNum++
+		msg = &Message{Type: msgClose, ConnID: c.connID, SeqNum: c.seqNum}
+	} else {
+		if atomic.LoadInt32(&c.connState) >= stateActiveClosing {
+			return ErrClosed
+		}
+
+		c.seqNum++
+		msg = NewData(c.connID, c.seqNum, len(payload), payload)
 	}
-
-	c.seqNum++
-	msg := NewData(c.connID, c.seqNum, len(payload), payload)
-
 	c.sendMsgC <- msg
-
 	return nil
+}
+
+func (c *client) Write(payload []byte) error {
+	return c.write(payload, false)
 }
 
 func (c *client) Close() error {
 
-	debug("client [%d] closing...\n", c.connID)
+	debug("[client %d] closing...\n", c.connID)
 
 	state := atomic.LoadInt32(&c.connState)
-	if state == stateClosing || state == stateClosed {
+	if state >= stateActiveClosing {
 		return ErrClosed
 	}
 
-	atomic.StoreInt32(&c.connState, stateClosing)
+	atomic.StoreInt32(&c.connState, stateActiveClosing)
 
 	c.closeC <- struct{}{}
 
 	<-c.notifyC
 	<-c.notifyC
 
-	if atomic.CompareAndSwapInt32(&c.connState, stateClosing, stateClosed) {
-		close(c.closeC)
+	for state := atomic.LoadInt32(&c.connState); state < stateActiveClosed; {
+		if atomic.CompareAndSwapInt32(&c.connState, state, stateActiveClosed) {
+			close(c.closeC)
+		}
 	}
 
-	debug("client [%d] closed\n", c.connID)
+	debug("[client %d] closed\n", c.connID)
 	return nil
 }
